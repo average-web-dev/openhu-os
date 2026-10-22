@@ -1,0 +1,22 @@
+# Raspberry Pi firmware configuration of OpenHU OS, the same in both boot partitions (rpi/assemble.sh). The kernel
+# command line with the slot's root is in cmdline.txt next to it.
+[all]
+arm_64bit=1
+# kernel8.img (Pi 4) / kernel_2712.img (Pi 5) load initramfs8 / initramfs_2712
+auto_initramfs=1
+# KMS display driver; the firmware finds DSI displays and adds their overlay
+dtoverlay=vc4-kms-v3d
+display_auto_detect=1
+disable_overscan=1
+# No rainbow square: the boot splash comes from Plymouth in the initrd
+disable_splash=1
+boot_delay=0
+# 3.5 mm jack (Pi 4) and HDMI audio
+dtparam=audio=on
+
+[pi4]
+# both HDMI ports
+max_framebuffers=2
+arm_boost=1
+
+[all]

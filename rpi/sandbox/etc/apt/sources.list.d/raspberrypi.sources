@@ -1,0 +1,9 @@
+# Raspberry Pi archive: only for the packages allowed in preferences.d/raspberrypi (kernels, firmware), everything
+# else stays Debian. Key: Raspberry Pi Archive Signing Key, CF8A 1AF5 02A2 AA2D 763B AE7E 82B1 2992 7FA3 303E, from
+# raspberrypi-archive-keyring 2025.1+rpt1 (/etc/apt/trusted.gpg.d/raspberrypi-archive.asc). Not the key file on the
+# archive's web site: that copy still has SHA-1 self-signatures, which APT rejects since 2026-02.
+Types: deb
+URIs: https://archive.raspberrypi.com/debian/
+Suites: trixie
+Components: main
+Signed-By: /etc/apt/keyrings/raspberrypi.asc
