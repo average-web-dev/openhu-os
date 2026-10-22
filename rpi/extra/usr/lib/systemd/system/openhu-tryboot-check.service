@@ -1,0 +1,18 @@
+# Raspberry Pi (#39): a version installed by openhu-update boots once with the firmware's tryboot. This check keeps
+# it when OpenHU comes up (/usr/libexec/openhu-os/tryboot commit: autoboot.txt boots it from now on); otherwise the
+# system reboots normally, which is the version before, and that one starts the next try while tries are left. On
+# x86 openhu-boot-check.service does the same for systemd-boot.
+[Unit]
+Description=OpenHU boot check of a tried version (keeps it only when OpenHU comes up)
+After=openhu-session.service
+ConditionPathExists=/proc/device-tree/chosen/bootloader
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/openhu-os/tryboot is-trial
+ExecStart=/usr/libexec/openhu-os/boot-check
+ExecStartPost=/usr/libexec/openhu-os/tryboot commit
+FailureAction=reboot
+
+[Install]
+WantedBy=graphical.target

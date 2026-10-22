@@ -5,6 +5,8 @@
   trial     a new version is being tried (openhu-update installed it with three tries), "attempt" of "tries"
   updated   the same after openhu-boot-check found OpenHU running: the new version stays
   rollback  a newer version failed three times, systemd-boot booted the version before ("failed")
+
+On the Raspberry Pi /usr/libexec/openhu-os/tryboot does the same with the firmware's tryboot.
 """
 import json
 import os
@@ -12,6 +14,7 @@ import re
 import subprocess
 
 GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+TRYBOOT = "/usr/libexec/openhu-os/tryboot"
 ENTRY = re.compile(r"^openhu-os_(?P<version>[^+]+?)(\+(?P<left>\d+)(-(?P<done>\d+))?)?\.efi$")
 
 
@@ -28,6 +31,9 @@ def version_key(version):
 
 
 def main():
+    if not os.path.isdir("/sys/firmware/efi") and os.path.exists(TRYBOOT):
+        # Raspberry Pi: the firmware's tryboot instead of systemd-boot (#39), same boot-status.json
+        os.execv(TRYBOOT, [TRYBOOT, "boot"])
     with open("/usr/lib/os-release") as f:
         running = next((l.split("=", 1)[1].strip().strip('"') for l in f if l.startswith("IMAGE_VERSION=")), "")
     status = {"state": "normal", "running": running}

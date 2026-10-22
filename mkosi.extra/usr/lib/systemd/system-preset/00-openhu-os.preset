@@ -5,6 +5,8 @@ enable systemd-timesyncd.service
 enable openhu-session.service
 enable openhu-boot-check.service
 enable openhu-boot-status.service
+# Raspberry Pi only (rpi/extra): the boot check of a version tried with tryboot
+enable openhu-tryboot-check.service
 # only starts when switched on (openhu-ssh), see ssh.service.d/openhu-os.conf
 enable ssh.service
 enable fstrim.timer

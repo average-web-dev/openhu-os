@@ -1,0 +1,271 @@
+#!/usr/bin/python3
+"""A/B boot of OpenHU OS on the Raspberry Pi with the firmware's tryboot (#39).
+
+  tryboot status [--json]   the two boot partitions: version and state (good, trying, failed, empty)
+  tryboot arm               the next reboot tries the installed version: one try less, reboot argument "0 tryboot"
+  tryboot boot              at boot (openhu-boot-status.service): boot status, starts a try that is still due
+  tryboot is-trial          exit code 0 when this boot tries a new version
+  tryboot commit            the tried version stays: autoboot.txt boots it from now on
+
+Partitions, FAT first (the firmware counts boot_partition= in FAT partitions, rpi-eeprom#654): 1 autoboot.txt, 2 and
+3 the boot partitions of the two slots, then the root slots and the data partition. A boot partition is labelled
+openhu-boot_<version> (good), openhu-boot_<version>+N (installed, N tries left, like systemd-boot's counter in the
+file name on x86) or _empty. autoboot.txt: [all] boot_partition=<running>, [tryboot] boot_partition=<other>.
+
+A try: the counter goes from +N to +N-1, then a reboot with "0 tryboot" boots the other boot partition once. The
+firmware clears the flag before it starts, so a hang (watchdog), a failed boot check or a power cut boots the
+running version again; that one starts the next try while tries are left and reports a rollback after the last.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+DT = "/proc/device-tree/chosen/bootloader"
+AUTOBOOT_LABEL = "openhu-autoboot"
+EMPTY_LABEL = "_empty"
+BOOT_PREFIX = "openhu-boot_"
+BOOT_RE = re.compile(rf"^{re.escape(BOOT_PREFIX)}(?P<version>[^+]+)(\+(?P<left>\d+))?$")
+ESP_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+TRIES = 3
+# GPT partition names have 36 UTF-16 characters
+LABEL_MAX = 36
+RUN = "/run/openhu-os"
+AUTOBOOT_MOUNT = RUN + "/autoboot"
+REBOOT_PARAM = "/run/systemd/reboot-param"
+
+
+class TrybootError(Exception):
+    pass
+
+
+def available():
+    return os.path.isdir(DT)
+
+
+def dt_value(name):
+    """A 32-bit value the firmware put into the device tree (big endian)"""
+    with open(os.path.join(DT, name), "rb") as f:
+        return int.from_bytes(f.read(4), "big")
+
+
+def in_tryboot():
+    return dt_value("tryboot") == 1
+
+
+def version_key(version):
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in re.split(r"[.~-]", version)]
+
+
+def running_version():
+    with open("/usr/lib/os-release") as f:
+        for line in f:
+            if line.startswith("IMAGE_VERSION="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+# --- partitions ---
+
+def lsblk(*args):
+    out = subprocess.run(["lsblk", "--json", "--bytes", "-o", "PATH,PKNAME,PARTN,PARTTYPE,PARTLABEL,SIZE", *args],
+                         check=True, capture_output=True, text=True).stdout
+    return json.loads(out)["blockdevices"]
+
+
+def disk():
+    source = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "/"], check=True, capture_output=True,
+                            text=True).stdout.strip()
+    return "/dev/" + lsblk("--nodeps", os.path.realpath(source))[0]["pkname"]
+
+
+def partitions():
+    """(disk, autoboot partition, running boot partition, other boot partition) as lsblk entries"""
+    device = disk()
+    parts = lsblk(device)
+    esps = [p for p in parts if (p.get("parttype") or "").lower() == ESP_TYPE]
+    autoboot = [p for p in esps if p.get("partlabel") == AUTOBOOT_LABEL]
+    boots = [p for p in esps if p.get("partlabel") != AUTOBOOT_LABEL]
+    if len(autoboot) != 1 or len(boots) != 2:
+        raise TrybootError(f"expected autoboot.txt and two boot partitions on {device}")
+    running_n = dt_value("partition")
+    running = [p for p in boots if p["partn"] == running_n]
+    if not running:
+        raise TrybootError(f"running from partition {running_n}, which is no boot partition of {device}")
+    other = [p for p in boots if p["partn"] != running_n][0]
+    return device, autoboot[0], running[0], other
+
+
+def parse(partition):
+    """(version, tries left or None) of a boot partition, (None, None) when empty"""
+    match = BOOT_RE.match(partition.get("partlabel") or "")
+    if not match:
+        return None, None
+    left = match.group("left")
+    return match.group("version"), int(left) if left is not None else None
+
+
+def boot_label(version, left=None):
+    label = BOOT_PREFIX + version + (f"+{left}" if left is not None else "")
+    if len(label) > LABEL_MAX:
+        raise TrybootError(f"version {version} is too long for a partition name")
+    return label
+
+
+def set_label(device, partition, label):
+    # the kernel keeps its partition table while the disk is in use: the label is on the disk, that is enough
+    result = subprocess.run(["sfdisk", "--quiet", "--part-label", device, str(partition["partn"]), label],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise TrybootError(f"sfdisk: {result.stderr.strip()}")
+    os.sync()
+    subprocess.run(["udevadm", "trigger", "--action=change", "--settle", partition["path"]], check=False)
+    partition["partlabel"] = label
+
+
+def write_autoboot(autoboot, default, trial):
+    """autoboot.txt: boots partition default, once trial after "0 tryboot". Written in place: with one-digit
+    partition numbers the file keeps its length, so only its one data sector changes."""
+    text = f"[all]\ntryboot_a_b=1\nboot_partition={default}\n[tryboot]\nboot_partition={trial}\n"
+    os.makedirs(AUTOBOOT_MOUNT, exist_ok=True)
+    subprocess.run(["mount", "-t", "vfat", "-o", "noatime", autoboot["path"], AUTOBOOT_MOUNT], check=True)
+    try:
+        path = os.path.join(AUTOBOOT_MOUNT, "autoboot.txt")
+        with open(path, "r+" if os.path.exists(path) else "w") as f:
+            if f.read() != text:
+                f.seek(0)
+                f.write(text)
+                f.truncate()
+                f.flush()
+                os.fsync(f.fileno())
+    finally:
+        subprocess.run(["umount", AUTOBOOT_MOUNT], check=False)
+
+
+# --- commands ---
+
+def status():
+    """[{partition, label, version, state, tries_left, running}] for openhu-update status"""
+    _, _, running, other = partitions()
+    entries = []
+    for partition in (running, other):
+        version, left = parse(partition)
+        if version is None:
+            state = "empty"
+        elif left is None:
+            state = "good"
+        else:
+            state = "trying" if left > 0 or partition is running else "failed"
+        entries.append({"partition": partition["path"], "label": partition.get("partlabel") or "",
+                        "version": version, "state": state, "tries_left": left, "running": partition is running})
+    return entries
+
+
+def arm():
+    """One try less, then the next reboot boots the other boot partition once"""
+    device, autoboot, running, other = partitions()
+    version, left = parse(other)
+    if version is None or not left:
+        raise TrybootError("no installed version with tries left in the other slot")
+    write_autoboot(autoboot, running["partn"], other["partn"])
+    set_label(device, other, boot_label(version, left - 1))
+    os.makedirs(os.path.dirname(REBOOT_PARAM), exist_ok=True)
+    with open(REBOOT_PARAM, "w") as f:
+        f.write("0 tryboot\n")
+    return version, TRIES - left + 1
+
+
+def is_trial():
+    if not available() or not in_tryboot():
+        return False
+    _, _, running, _ = partitions()
+    return parse(running)[1] is not None
+
+
+def commit():
+    """The tried version stays: autoboot.txt first (a power cut after it boots the new version, which drops its
+    counter at the next boot), then the counter"""
+    device, autoboot, running, other = partitions()
+    version, left = parse(running)
+    if left is None:
+        return version
+    write_autoboot(autoboot, running["partn"], other["partn"])
+    set_label(device, running, boot_label(version))
+    return version
+
+
+def boot():
+    """Boot status for the splash and OpenHU (boot-status.json, as with systemd-boot on x86), and the next try"""
+    running_v = running_version()
+    status = {"state": "normal", "running": running_v}
+    message = None
+    device, _, running, other = partitions()
+    version, left = parse(running)
+    if left is not None and in_tryboot():
+        status.update(state="trial", tries=TRIES, attempt=TRIES - left)
+        message = f"Checking the new version {running_v} – try {TRIES - left} of {TRIES}"
+    else:
+        if left is not None:
+            # booted normally from a partition with a counter: committed by autoboot.txt, the counter was not removed
+            set_label(device, running, boot_label(version))
+        other_v, other_left = parse(other)
+        if other_left:
+            # an installed version with tries left: the next try, before the session starts
+            write_status(status)
+            other_v, attempt = arm()
+            message = f"Starting the new version {other_v} – try {attempt} of {TRIES}"
+            show(message)
+            subprocess.run(["systemctl", "reboot", "--no-block"], check=False)
+            return
+        if other_v is not None and other_left == 0:
+            status.update(state="rollback", failed=other_v)
+            message = f"Update to {other_v} failed – previous version restored"
+    write_status(status)
+    if message:
+        with open(os.path.join(RUN, "boot-message"), "w") as f:  # boot-check adds its time to it
+            f.write(message)
+        show(message)
+
+
+def write_status(status):
+    os.makedirs(RUN, exist_ok=True)
+    with open(os.path.join(RUN, "boot-status.json"), "w") as f:
+        json.dump(status, f)
+
+
+def show(message):
+    print(message)
+    subprocess.run(["plymouth", "display-message", f"--text={message}"], check=False)
+
+
+def main(args):
+    command = args[0] if args else "status"
+    try:
+        if not available():
+            raise TrybootError("not a Raspberry Pi with the tryboot firmware (no /proc/device-tree/chosen/bootloader)")
+        if command == "status":
+            entries = status()
+            if "--json" in args:
+                print(json.dumps(entries))
+            else:
+                for e in entries:
+                    print(f"{e['partition']}: {e['label'] or 'empty'} ({e['state']}{', running' if e['running'] else ''})")
+        elif command == "arm":
+            version, attempt = arm()
+            print(f"the next reboot tries {version} (try {attempt} of {TRIES})")
+        elif command == "boot":
+            boot()
+        elif command == "is-trial":
+            sys.exit(0 if is_trial() else 1)
+        elif command == "commit":
+            print(f"version {commit()} stays")
+        else:
+            sys.exit(__doc__)
+    except (TrybootError, subprocess.CalledProcessError, OSError) as e:
+        print(f"tryboot: {e}", file=sys.stderr)
+        sys.exit(2 if command == "is-trial" else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

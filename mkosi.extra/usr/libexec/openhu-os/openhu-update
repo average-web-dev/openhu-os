@@ -13,7 +13,9 @@ OpenHU runs it as the openhu user with pkexec (polkit allows this program). The 
 "error" | "cancelled", "from", "version", "phase": "root" | "kernel", "percent" (0-100 over both), "error"}.
 
 The update server is a directory with SHA256SUMS, openhu-os_<version>.root.raw.gz (root partition) and
-openhu-os_<version>.efi (unified kernel image), see scripts/add-update.sh. Its URL: OPENHU_UPDATE_URL, else URL= in
+openhu-os_<version>.efi (unified kernel image), see scripts/add-update.sh. The Raspberry Pi image (VARIANT_ID=rpi in
+os-release) takes openhu-os-rpi_<version>.root.raw.gz and openhu-os-rpi_<version>.boot.raw.gz (its boot partition)
+instead. Its URL: OPENHU_UPDATE_URL, else URL= in
 /var/lib/openhu-os/update.conf, else in /usr/lib/openhu-os/update.conf.
 
 A USB stick is a second source: the same files, in the stick's top folder, in openhu-os/ or in a folder below
@@ -29,10 +31,19 @@ running version bootable:
   3. write and verify the unified kernel image as EFI/Linux/openhu-os_<version>+3.efi
 systemd-boot boots the newest version first and counts its tries. openhu-boot-check.service marks it good when
 OpenHU answers; after three failed tries systemd-boot boots the version before again.
+
+On the Raspberry Pi (#39) the other slot is a boot partition and a root partition, and steps 1 and 3 are:
+  1. relabel the other boot partition "_empty", then its root slot
+  3. write and verify the boot partition, relabel it "openhu-boot_<version>+3", then arm the first try
+/usr/libexec/openhu-os/tryboot counts the tries in that label and boots it with the firmware's tryboot; the next
+reboot (also a power cut: the running version starts it) tries the new version, openhu-tryboot-check.service keeps
+it when OpenHU answers.
 """
 import fcntl
 import gzip
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -61,6 +72,21 @@ STATE = "/run/openhu-os/update.json"
 UNIT = "openhu-update.service"
 # share of the root partition in the overall percent (it is about 90 % of the download)
 ROOT_SHARE = 90
+TRYBOOT = "/usr/libexec/openhu-os/tryboot"
+
+
+def os_release(key):
+    with open("/usr/lib/os-release") as f:
+        for line in f:
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+# Raspberry Pi image (#39): its update files are openhu-os-rpi_<version>.*, the second one is the boot partition
+RPI = os_release("VARIANT_ID") == "rpi"
+NAME = "openhu-os-rpi" if RPI else IMAGE_ID
+BOOT_FILE = ".boot.raw.gz" if RPI else ".efi"
 
 JSON = False
 
@@ -114,11 +140,15 @@ def version_key(version):
 
 
 def running_version():
-    with open("/usr/lib/os-release") as f:
-        for line in f:
-            if line.startswith("IMAGE_VERSION="):
-                return line.split("=", 1)[1].strip().strip('"')
-    fail("no IMAGE_VERSION in /usr/lib/os-release")
+    return os_release("IMAGE_VERSION") or fail("no IMAGE_VERSION in /usr/lib/os-release")
+
+
+def load_tryboot():
+    """The Pi's boot helper as a module (partitions, labels, tries)"""
+    loader = importlib.machinery.SourceFileLoader("tryboot", TRYBOOT)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("tryboot", loader))
+    loader.exec_module(module)
+    return module
 
 
 def server_url():
@@ -214,7 +244,7 @@ def fetch(url):
 
 
 def available(base):
-    """{version: {file name: sha256}} with both files of a version"""
+    """{version: {file name: sha256}} with both files of a version of this image (x86 or Pi)"""
     with fetch(urllib.parse.urljoin(base, "SHA256SUMS")) as response:
         sums = {}
         for line in response.read().decode().splitlines():
@@ -223,11 +253,11 @@ def available(base):
                 sums[parts[1].lstrip("*")] = parts[0].lower()
     versions = {}
     for name in sums:
-        match = re.match(rf"^{re.escape(IMAGE_ID)}_(.+)\.efi$", name)
-        if match and f"{IMAGE_ID}_{match.group(1)}.root.raw.gz" in sums:
+        match = re.match(rf"^{re.escape(NAME)}_(.+)\.root\.raw\.gz$", name)
+        if match and f"{NAME}_{match.group(1)}{BOOT_FILE}" in sums:
             version = match.group(1)
-            versions[version] = {n: sums[n] for n in (f"{IMAGE_ID}_{version}.efi",
-                                                       f"{IMAGE_ID}_{version}.root.raw.gz")}
+            versions[version] = {n: sums[n] for n in (f"{NAME}_{version}{BOOT_FILE}",
+                                                       f"{NAME}_{version}.root.raw.gz")}
     return versions
 
 
@@ -315,10 +345,11 @@ class HashingReader:
         return data
 
 
-def write_root(url, sha256, device, size, fields):
+def write_partition(url, sha256, device, size, fields, phase="root", start=0, share=ROOT_SHARE, what="root partition"):
+    """A compressed partition image into a partition, checked against its SHA-256"""
     with fetch(url) as response:
         total = int(response.headers.get("Content-Length") or 0)
-        reader = HashingReader(response, Progress("root", total, 0, ROOT_SHARE, fields))
+        reader = HashingReader(response, Progress(phase, total, start, share, fields))
         fd = os.open(device, os.O_WRONLY | os.O_CLOEXEC)
         try:
             written = 0
@@ -326,7 +357,7 @@ def write_root(url, sha256, device, size, fields):
                 while chunk := image.read(CHUNK):
                     written += len(chunk)
                     if written > size:
-                        fail(f"root image larger than the slot ({size} bytes)")
+                        fail(f"{what} image larger than the partition ({size} bytes)")
                     os.write(fd, chunk)
             while reader.read(CHUNK):  # trailing data still counts for the checksum
                 pass
@@ -334,7 +365,7 @@ def write_root(url, sha256, device, size, fields):
         finally:
             os.close(fd)
     if reader.sha.hexdigest() != sha256:
-        fail("root partition: checksum mismatch, the slot stays empty")
+        fail(f"{what}: checksum mismatch, the slot stays empty")
 
 
 def write_uki(url, sha256, version, fields):
@@ -366,16 +397,26 @@ def unit_active():
 def status():
     running, other, _ = slots()
     entries = []
-    for name, (version, left) in boot_entries().items():
-        entries.append({"file": name, "version": version,
-                        "state": "good" if left is None else ("trying" if left > 0 else "failed"), "tries_left": left})
+    if RPI:
+        # the boot partitions, "file" is the partition's label
+        boot = "boot partition " + ", ".join(e["partition"] for e in load_tryboot().status() if e["running"])
+        for e in load_tryboot().status():
+            if e["version"] is not None:
+                entries.append({"file": e["label"], "version": e["version"], "state": e["state"],
+                                "tries_left": e["tries_left"]})
+    else:
+        boot = f"boot entry {efi_var('LoaderEntrySelected')}"
+        for name, (version, left) in boot_entries().items():
+            entries.append({"file": name, "version": version,
+                            "state": "good" if left is None else ("trying" if left > 0 else "failed"),
+                            "tries_left": left})
     state = read_state()
     if state.get("state") in ("checking", "installing") and not unit_active():
         state = {"state": "idle"}  # left over from an update that ended with the power
     usb = read_json(USB_STATE)
     data = {"running": running_version(), "slot": running["path"], "other": slot_version(other),
             "other_slot": other["path"], "entries": entries, "update": state, "active": unit_active(), "usb": usb}
-    lines = [f"running:    {data['running']} ({running['path']}, boot entry {efi_var('LoaderEntrySelected')})",
+    lines = [f"running:    {data['running']} ({running['path']}, {boot})",
              f"other slot: {data['other'] or 'empty'} ({other['path']})"]
     for entry in entries:
         left = entry["tries_left"]
@@ -459,7 +500,8 @@ def update(version=None, reboot=False):
         fail(f"version {version} is running")
 
     running, other, disk = slots()
-    if not os.path.isdir(UKI_DIR):
+    tryboot = load_tryboot() if RPI else None
+    if not RPI and not os.path.isdir(UKI_DIR):
         fail(f"{UKI_DIR} not found (ESP not mounted?)")
     source, base, files = versions[version]
     fields = {"from": current, "version": version, "source": source}
@@ -468,28 +510,46 @@ def update(version=None, reboot=False):
         print(f"update {current} -> {version} into {other['path']}" + (" from the USB stick" if source == "usb" else ""))
 
     labelled = False
+    other_boot = None
+    errors = (Cancelled, UpdateError, OSError, EOFError, urllib.error.URLError)
     try:
         # 1. the other slot's version can no longer boot, then its slot is free
         old = slot_version(other)
-        if old:
+        if RPI:
+            _, _, _, other_boot = tryboot.partitions()
+            tryboot.boot_label(version)  # fits into a partition name
+            tryboot.set_label(disk, other_boot, EMPTY_LABEL)
+        elif old:
             remove_entries(old)
         set_label(disk, other, EMPTY_LABEL)
 
         # 2. root partition, labelled only once it is complete
-        write_root(urllib.parse.urljoin(base, f"{IMAGE_ID}_{version}.root.raw.gz"),
-                   files[f"{IMAGE_ID}_{version}.root.raw.gz"], other["path"], other["size"], fields)
+        write_partition(urllib.parse.urljoin(base, f"{NAME}_{version}.root.raw.gz"),
+                        files[f"{NAME}_{version}.root.raw.gz"], other["path"], other["size"], fields)
         set_label(disk, other, SLOT_PREFIX + version)
         labelled = True
 
-        # 3. boot entry: from now on systemd-boot tries the new version first
-        write_uki(urllib.parse.urljoin(base, f"{IMAGE_ID}_{version}.efi"), files[f"{IMAGE_ID}_{version}.efi"],
-                  version, fields)
-    except (Cancelled, UpdateError, OSError, EOFError, urllib.error.URLError) as e:
+        # 3. boot entry: from now on systemd-boot tries the new version first; on the Pi the boot partition with
+        # its tries in the label, and the first try armed: the next reboot boots it
+        if RPI:
+            write_partition(urllib.parse.urljoin(base, f"{NAME}_{version}.boot.raw.gz"),
+                            files[f"{NAME}_{version}.boot.raw.gz"], other_boot["path"], other_boot["size"], fields,
+                            phase="kernel", start=ROOT_SHARE, share=100 - ROOT_SHARE, what="boot partition")
+            tryboot.set_label(disk, other_boot, tryboot.boot_label(version, tryboot.TRIES))
+            tryboot.arm()
+        else:
+            write_uki(urllib.parse.urljoin(base, f"{IMAGE_ID}_{version}.efi"), files[f"{IMAGE_ID}_{version}.efi"],
+                      version, fields)
+    except errors + ((tryboot.TrybootError,) if RPI else ()) as e:
         # the slot without a boot entry: empty again, so nothing shows a version that cannot boot
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if labelled:
             set_label(disk, other, EMPTY_LABEL)
-        remove_entries(version)
+        if RPI:
+            if other_boot is not None:
+                tryboot.set_label(disk, other_boot, EMPTY_LABEL)
+        else:
+            remove_entries(version)
         if isinstance(e, Cancelled):
             report(**fields, state="cancelled")
             raise
