@@ -5,7 +5,10 @@ Description=OpenHU OS boot status (update tries, rollback)
 DefaultDependencies=no
 After=plymouth-start.service systemd-tmpfiles-setup-dev.service
 Before=sysinit.target
-ConditionPathExists=/sys/firmware/efi
+# UEFI (systemd-boot) or the Raspberry Pi firmware (tryboot, #39); udev: the Pi's helper changes partition labels
+ConditionPathExists=|/sys/firmware/efi
+ConditionPathExists=|/proc/device-tree/chosen/bootloader
+After=systemd-udevd.service
 
 [Service]
 Type=oneshot

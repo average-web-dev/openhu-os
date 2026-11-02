@@ -23,7 +23,7 @@ trap 'rm -rf "$tmp"' EXIT
 PREVIOUS_MANIFEST=""
 PREVIOUS_DATE=""
 if [ -n "$PREVIOUS" ]; then
-  gh release download "$PREVIOUS" -R "$OS_REPO" -p '*.manifest.json' -D "$tmp" >/dev/null 2>&1 &&
+  gh release download "$PREVIOUS" -R "$OS_REPO" -p 'openhu-os_*.manifest.json' -D "$tmp" >/dev/null 2>&1 &&
     PREVIOUS_MANIFEST="$(ls "$tmp"/*.manifest.json | head -1)"
   PREVIOUS_DATE="$(gh release view "$PREVIOUS" -R "$OS_REPO" --json publishedAt -q .publishedAt)"
 fi
@@ -131,14 +131,17 @@ AASDK_OLD=""
   echo
   echo "## Installation"
   echo
-  echo "**New installation:** \`xz -d openhu-os_$VERSION.raw.xz\`, write it to the disk or SD card"
-  echo "(\`dd\`, balenaEtcher). It grows to the whole disk on the first boot."
+  echo "**New installation:** \`xz -d openhu-os_$VERSION.raw.xz\` (PC, UEFI) or"
+  echo "\`openhu-os-rpi_$VERSION.raw.xz\` (Raspberry Pi 4 and 5), write it to the disk or SD card (\`dd\`,"
+  echo "balenaEtcher, Raspberry Pi Imager). It grows to the whole disk on the first boot. A Raspberry Pi 4 needs a"
+  echo "bootloader from 2022-11-25 or newer (Raspberry Pi Imager: Misc utility images → Bootloader)."
   echo
   echo "**Update** of a running OpenHU OS: Settings → System, or \`openhu-cli update install --reboot\` (root"
   echo "partition and kernel image of this release, back to the version before if OpenHU does not come up; images"
   echo "from before openhu-cli: \`openhu update install --reboot\`)."
   echo
   echo "**Without internet:** copy \`SHA256SUMS\`, \`openhu-os_$VERSION.root.raw.gz\` and"
-  echo "\`openhu-os_$VERSION.efi\` to a USB stick (FAT32, exFAT, NTFS or ext4) and plug it in: OpenHU offers the"
-  echo "update (Settings → System)."
+  echo "\`openhu-os_$VERSION.efi\` (PC) or \`openhu-os-rpi_$VERSION.root.raw.gz\` and"
+  echo "\`openhu-os-rpi_$VERSION.boot.raw.gz\` (Raspberry Pi) to a USB stick (FAT32, exFAT, NTFS or ext4) and plug"
+  echo "it in: OpenHU offers the update (Settings → System)."
 }

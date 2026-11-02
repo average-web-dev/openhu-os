@@ -1,6 +1,8 @@
-# Builds the OpenHU OS images with the newest OpenHU from its CI, tests the dev image in a VM (KVM, power cuts) and
-# builds the release image. A tag v<version> (digits and dots, e.g. v2026.10.13) publishes it as a GitHub release:
-# the disk image to flash and the update that "openhu-cli update" installs (releases/latest/download/).
+# Builds the OpenHU OS images with the newest OpenHU from its CI: the PC image (tests the dev image in a VM: KVM,
+# power cuts) and the Raspberry Pi image on an arm64 runner (checked without a Pi, scripts/check-rpi-image.sh; the
+# dev image is kept as an artifact to flash). A tag v<version> (digits and dots, e.g. v2026.10.13) publishes both as
+# one GitHub release: the disk images to flash and the updates that "openhu-cli update" installs
+# (releases/latest/download/, each device takes the files of its image).
 name: Image
 
 on:
@@ -14,20 +16,29 @@ permissions:
   contents: write  # the release of a tag
 
 jobs:
-  image:
+  # one version for both images
+  version:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Version
+      - id: version
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="${GITHUB_REF_NAME#v}"; else version="$(date -u +%Y.%m.%d.%H%M)"; fi
           case "$version" in
             ""|*[!0-9.]*) echo "version '$version': digits and dots only (tag v2026.10.13)" >&2; exit 1 ;;
           esac
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "OpenHU OS $version" >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
 
       - name: QEMU and KVM
         run: |
@@ -78,12 +89,107 @@ jobs:
           ls -lh dist >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: GitHub release
+      - name: Keep the release files
         if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x86-64
+          path: |
+            dist/
+            packages.source
+          retention-days: 3
+
+  image-rpi:
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OpenHU packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: arm64
+        run: |
+          scripts/fetch-debs.sh
+          ls packages | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build dev image
+        run: scripts/build.sh --arch arm64 --profile dev --version "$VERSION"
+
+      # Partitions, autoboot.txt, boot files, os-release; booting needs a real Pi (QEMU does not run its firmware)
+      - name: Check dev image
+        run: scripts/check-rpi-image.sh "mkosi.output/openhu-os-rpi_$VERSION.raw"
+
+      # To flash for tests on a Pi. Its ssh key is this run's own: log in with the dev password (root/openhu)
+      - name: Compress dev image
+        run: xz -T0 -6 -c "mkosi.output/openhu-os-rpi_$VERSION.raw" > "openhu-os-rpi-dev_$VERSION.raw.xz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhu-os-rpi-dev_${{ env.VERSION }}
+          path: openhu-os-rpi-dev_${{ env.VERSION }}.raw.xz
+          compression-level: 0
+          retention-days: 14
+
+      - name: Build release image
+        run: |
+          rm -f "openhu-os-rpi-dev_$VERSION.raw.xz"
+          scripts/build.sh --arch arm64 --profile release --version "$VERSION"
+
+      - name: Check release image
+        run: scripts/check-rpi-image.sh "mkosi.output/openhu-os-rpi_$VERSION.raw"
+
+      - name: Release files
+        run: |
+          scripts/release.sh "$VERSION" dist
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the release files
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-rpi
+          path: dist/
+          compression-level: 0
+          retention-days: 3
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, image, image-rpi]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86-64
+          path: x86-64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-rpi
+          path: rpi
+
+      - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # what changed since the previous release: OpenHU, libaasdk, pull requests, Debian packages
+          # both images in one directory, one SHA256SUMS over all files
+          mkdir dist
+          cp x86-64/dist/* rpi/* dist/
+          rm dist/SHA256SUMS
+          (cd dist && sha256sum * > SHA256SUMS)
+          # the notes are made from the PC image's package manifest and the OpenHU commit of its packages
+          mkdir -p mkosi.output
+          cp "dist/openhu-os_$VERSION.manifest.json" "mkosi.output/openhu-os_$VERSION.manifest"
+          cp x86-64/packages.source packages.source
           scripts/release-notes.sh "$VERSION" > notes.md
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
           gh release create "$GITHUB_REF_NAME" dist/* --title "OpenHU OS $VERSION" --notes-file notes.md

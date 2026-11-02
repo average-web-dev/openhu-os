@@ -241,6 +241,22 @@ Flash it to an SD card (16 GB or more) or a USB SSD with the Raspberry Pi Imager
 `dd if=mkosi.output/openhu-os-rpi_<version>.raw of=/dev/<card> bs=4M conv=fsync`. The dev image has ssh with the key
 in `local/id_ed25519` (`ssh -i local/id_ed25519 root@openhu.local`) and a serial console on GPIO 14/15.
 
+`scripts/check-rpi-image.sh mkosi.output/openhu-os-rpi_<version>.raw` checks an image without a Pi (partitions,
+`autoboot.txt`, boot files and command line, os-release); CI runs it on an arm64 runner for the dev and the release
+image and keeps the dev image as an artifact (`openhu-os-rpi-dev_<version>`, ssh as root with the password `openhu`).
+QEMU cannot boot the image: it does not run the Pi firmware.
+
+### Updates on the Pi
+
+The same `openhu-cli update`, with `openhu-os-rpi_<version>.root.raw.gz` and `.boot.raw.gz` (`scripts/add-update.sh`
+adds them for a Pi build). `openhu-update` writes both into the other slot and labels its boot partition
+`openhu-boot_<version>+3`: three tries, counted in the label by `/usr/libexec/openhu-os/tryboot`, which
+arms each one (one try less, `[tryboot] boot_partition=` on that partition, reboot argument `0 tryboot`). The next
+reboot boots the new version once; `openhu-tryboot-check.service` keeps it when OpenHU answers (`autoboot.txt` then
+boots it). A failed check, a hang (hardware watchdog, 15 s) or a power cut boots the version before, which starts the
+next try at boot and reports the rollback after the third (`boot-status.json` as on x86). `tryboot status` shows both
+boot partitions.
+
 ## Run in a VM
 
 ```bash
