@@ -40,7 +40,12 @@ Raspberry Pi and Linux. Flash it, boot it, and OpenHU starts.
   passed its boot check, `rollback`).
 
 - **USB sticks:** mounted read-only under `/run/media/<name>` while plugged in (FAT32, exFAT, NTFS, ext4); a power cut
-  or pulling the stick never harms it. Updates from a stick, see below.
+  or pulling the stick never harms it. Updates from a stick, see below. The one write: `openhu-cli usb write <stick>
+  Playlists/<name>.m3u8 < content` (the media player's playlists, at most 1 MB) remounts the stick read-write, writes a
+  temporary file, renames it, syncs and remounts it read-only, also on errors. On ext4 the remount keeps `noload`
+  (no journal for that moment, like FAT); a stick whose journal was never replayed is mounted read-write with the
+  journal instead (refused while a file on it is open).
+- **Media:** mpv and python3-mutagen for the media player plugin (`org.openhu.media`).
 
 Planned ([roadmap](https://github.com/average-web-dev/openhu/issues/1)): signed checksums
 ([#21](https://github.com/average-web-dev/openhu-os/issues/21)), Raspberry Pi 4/5.
@@ -67,12 +72,13 @@ openhu-cli log | start | stop | restart # OpenHU's log (journal of openhu-sessio
 ```
 
 `openhu-cli ethernet status | mode client|server` sets the Ethernet port (see Ethernet).
+`openhu-cli usb write sdb1 Playlists/Car.m3u8 < Car.m3u8` saves a playlist on a USB stick (see USB sticks).
 
 `--json` gives every command's result as JSON for scripts; errors end with exit code 1 (`{"error": ...}`). Without
-a running OpenHU the system commands still work, the others say so. The system commands (`update`, `ssh`, `time`, `ethernet`,
-`start`, `stop`, `restart`) need root: the `openhu` user runs `update`, `ssh`, `time`, `ethernet` and `restart` through `pkexec`
-(the polkit rule allows exactly these, OpenHU's settings use them so), `openhu-cli` does that by itself. The work is
-done by helpers in `/usr/libexec/openhu-os` (`openhu-update`, `openhu-ssh`, `openhu-time`, `openhu-ethernet`), which are not meant to be
+a running OpenHU the system commands still work, the others say so. The system commands (`update`, `ssh`, `time`, `ethernet`, `usb`,
+`start`, `stop`, `restart`) need root: the `openhu` user runs `update`, `ssh`, `time`, `ethernet`, `usb` and `restart` through `pkexec`
+(the polkit rule allows exactly these, OpenHU's settings and plugins use them so), `openhu-cli` does that by itself. The work is
+done by helpers in `/usr/libexec/openhu-os` (`openhu-update`, `openhu-ssh`, `openhu-time`, `openhu-ethernet`, `usb-stick`), which are not meant to be
 called directly.
 
 OpenHU itself (`/usr/libexec/openhu/openhu`) is not in PATH: `openhu-session.service` runs it in cage, `openhu-cli

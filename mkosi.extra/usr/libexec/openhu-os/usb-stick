@@ -2,9 +2,118 @@
 # Mounts a USB stick read-only under /run/media/<name> (a power cut or pulling it never harms it) and tells
 # openhu-update to look for updates on it. Run by openhu-usb@<name>.service, started by udev.
 #   usb-stick mount|unmount NAME (sdb1)
+#   usb-stick write NAME PATH < content
+# write: the one way to change a stick, for plugins through "pkexec openhu-cli usb write" (the media player saves its
+# playlists so). Only Playlists/<name>.m3u8, at most 1 MB from stdin. The stick is writable for a moment: remounted
+# read-write, a temporary file renamed into place, synced and read-only again (also on errors).
 set -u
-action="$1"; name="$2"
+action="${1:-}"; name="${2:-}"
 dir="/run/media/$name"
+MAX_SIZE=1048576
+
+mount_options() {
+    # $type and $options for the stick's file system, read-only
+    type=$(blkid -o value -s TYPE "/dev/$name")
+    options=ro,nosuid,nodev,noexec
+    case "$type" in
+        # no owners on these file systems: the files belong to openhu (plugins, e.g. music from the stick)
+        vfat|exfat) options="$options,uid=$(id -u openhu),gid=$(id -g openhu),fmask=0133,dmask=0022" ;;
+        ntfs) type=ntfs3; options="$options,uid=$(id -u openhu),gid=$(id -g openhu),fmask=0133,dmask=0022" ;;
+        # read-only also for the journal: no replay (a stick with an unclean ext4 still mounts)
+        ext4|ext3|ext2) type=ext4; options="$options,noload" ;;
+    esac
+}
+
+fail() {
+    echo "$*" >&2
+    exit 1
+}
+
+write() {
+    path="${3:-}"
+    case "$name" in ""|*[!A-Za-z0-9_-]*) fail "not a USB stick: $name" ;; esac
+    [ "$(findmnt -n -o SOURCE --mountpoint "$dir" 2>/dev/null)" = "/dev/$name" ] || fail "no USB stick $name in /run/media"
+    # Playlists/<name>.m3u8: one file name, no hidden files, nothing a FAT stick cannot store
+    file="${path#Playlists/}"
+    case "$path" in Playlists/*) ;; *) fail "only Playlists/<name>.m3u8 can be written: $path" ;; esac
+    case "$file" in
+        */*|.*|*\\*|*[\<\>:\"\|\?\*]*) fail "not a playlist name: $file" ;;
+        *.m3u8) ;;
+        *) fail "only Playlists/<name>.m3u8 can be written: $path" ;;
+    esac
+    printf %s "$file" | LC_ALL=C grep -q '[[:cntrl:]]' && fail "not a playlist name: $file"
+    [ "$(printf %s "$file" | wc -c)" -le 200 ] || fail "the playlist name is too long"
+    target="$dir/Playlists/$file"
+    # nothing on the stick may lead elsewhere (an ext4 stick can have symlinks)
+    if [ -L "$dir/Playlists" ] || { [ -e "$dir/Playlists" ] && [ ! -d "$dir/Playlists" ]; }; then
+        fail "Playlists on the stick is not a folder"
+    fi
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+        fail "Playlists/$file on the stick is not a file"
+    fi
+
+    # one write at a time (the stick goes back to read-only after each one)
+    exec 9>/run/openhu-os/usb-write.lock
+    flock 9
+    # the content first, in RAM: the stick is writable only while it is copied
+    staged=$(mktemp /run/openhu-os/usb-write.XXXXXX) || fail "no temporary file"
+    temporary=""
+    trap cleanup EXIT
+    trap 'exit 1' HUP INT TERM
+    head -c $((MAX_SIZE + 1)) > "$staged" || fail "could not read the content"
+    size=$(stat -c %s "$staged")
+    [ "$size" -le "$MAX_SIZE" ] || fail "larger than 1 MB"
+
+    writable || fail "the USB stick cannot be written (write-protected or damaged?)"
+    mkdir -p "$dir/Playlists" || fail "could not make the folder Playlists"
+    temporary="$dir/Playlists/.openhu-write.tmp"
+    cat "$staged" > "$temporary" && sync "$temporary" || fail "could not write Playlists/$file (stick full?)"
+    # ext4 has owners: readable for everyone (vfat, exfat, ntfs3 have the mount's uid and modes)
+    chmod 0644 "$temporary" 2>/dev/null
+    mv -T "$temporary" "$target" || fail "could not write Playlists/$file"
+    temporary=""
+    sync -f "$dir/Playlists" || fail "could not write Playlists/$file"
+    echo "{\"written\": true, \"bytes\": $size}"
+}
+
+# read-write for the write; $restore says how cleanup makes it read-only again
+restore=""
+writable() {
+    mount_options
+    # ext4 is mounted with noload: a remount keeps it, the write then goes without the journal (a power cut in this
+    # moment is like on a FAT stick: fsck). Fine on a clean file system, but not over a journal that was never
+    # replayed (a stick pulled from a computer without ejecting): a computer would replay it later over the new
+    # write. Then mounted again read-write with the journal (replayed) and back to read-only with noload.
+    if [ "$type" = ext4 ] && dumpe2fs -h "/dev/$name" 2>/dev/null | grep -q '^Filesystem features:.* needs_recovery'; then
+        umount "$dir" 2>/dev/null \
+            || fail "the USB stick was not ejected cleanly and is in use: stop the playback from it and try again"
+        restore=mount
+        mount -t ext4 -o rw,nosuid,nodev,noexec "/dev/$name" "$dir"
+        return
+    fi
+    mount -o remount,rw "$dir" || return 1
+    restore=remount
+}
+
+cleanup() {
+    status=$?
+    [ -n "$temporary" ] && rm -f "$temporary"
+    rm -f "$staged"
+    case "$restore" in
+        remount)
+            mount -o remount,ro "$dir" || { echo "remounting the USB stick read-only failed" >&2; status=1; } ;;
+        mount)
+            if ! mountpoint -q "$dir"; then
+                mount -t "$type" -o "$options" "/dev/$name" "$dir" || { echo "could not mount the USB stick again" >&2; status=1; }
+            elif umount "$dir" 2>/dev/null; then
+                mount -t "$type" -o "$options" "/dev/$name" "$dir" || { echo "could not mount the USB stick again" >&2; status=1; }
+            else
+                # opened in the meantime: read-only with the journal until it is plugged in again
+                mount -o remount,ro "$dir" || { echo "remounting the USB stick read-only failed" >&2; status=1; }
+            fi ;;
+    esac
+    exit $status
+}
 
 case "$action" in
 mount)
@@ -16,15 +125,7 @@ mount)
         echo "$device is on the system disk, not mounted"
         exit 0
     fi
-    type=$(blkid -o value -s TYPE "$device")
-    options=ro,nosuid,nodev,noexec
-    case "$type" in
-        # no owners on these file systems: the files belong to openhu (plugins, e.g. music from the stick)
-        vfat|exfat) options="$options,uid=$(id -u openhu),gid=$(id -g openhu),fmask=0133,dmask=0022" ;;
-        ntfs) type=ntfs3; options="$options,uid=$(id -u openhu),gid=$(id -g openhu),fmask=0133,dmask=0022" ;;
-        # read-only also for the journal: no replay (a stick with an unclean ext4 still mounts)
-        ext4|ext3|ext2) type=ext4; options="$options,noload" ;;
-    esac
+    mount_options
     mkdir -p "$dir"
     if ! mount -t "$type" -o "$options" "$device" "$dir"; then
         rmdir "$dir" 2>/dev/null
@@ -37,8 +138,12 @@ unmount)
     mountpoint -q "$dir" && umount -l "$dir"
     rmdir "$dir" 2>/dev/null
     ;;
+write)
+    write "$@"
+    exit 0
+    ;;
 *)
-    echo "usage: usb-stick mount|unmount NAME" >&2
+    echo "usage: usb-stick mount|unmount NAME, usb-stick write NAME PATH < content" >&2
     exit 2
     ;;
 esac
