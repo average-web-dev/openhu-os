@@ -4,8 +4,9 @@ to the running OpenHU through its API (ws://127.0.0.1:<api port>). "openhu-cli h
 "openhu-cli help <command>" explains one. Every command takes --json (output for scripts); an error ends with exit
 code 1.
 
-The system commands (update, ssh, time, ethernet, start, stop, restart) run as root; as another user openhu-cli runs
-itself through pkexec (polkit allows the openhu user update, ssh, time, ethernet and restart, OpenHU's settings use them so). They call
+The system commands (update, ssh, time, ethernet, usb, start, stop, restart) run as root; as another user openhu-cli
+runs itself through pkexec (polkit allows the openhu user update, ssh, time, ethernet, usb and restart, OpenHU's
+settings and plugins use them so). They call
 the helpers in /usr/libexec/openhu-os, which do the work. OpenHU itself is not in PATH: openhu-session.service starts
 it (openhu-cli start/stop/restart).
 """
@@ -24,8 +25,8 @@ RUN = "/run/openhu-os"
 INI = "/var/lib/openhu/openhu.ini"
 SESSION = "openhu-session.service"
 # commands that need root; the openhu user may run PKEXEC_COMMANDS through pkexec (the polkit rule)
-ROOT_COMMANDS = ("update", "ssh", "time", "ethernet", "start", "stop", "restart")
-PKEXEC_COMMANDS = ("update", "ssh", "time", "ethernet", "restart")
+ROOT_COMMANDS = ("update", "ssh", "time", "ethernet", "usb", "start", "stop", "restart")
+PKEXEC_COMMANDS = ("update", "ssh", "time", "ethernet", "usb", "restart")
 PAGES = ["home", "aa", "settings", "store"] + ["settings/" + c for c in (
     "general", "aa", "audio", "wifi", "bluetooth", "network", "keys", "apps", "system", "info")]
 
@@ -407,6 +408,23 @@ def cmd_ethernet(args):
     return 0
 
 
+# usb
+
+MEDIA = "/run/media"
+
+
+def cmd_usb(args):
+    # the content comes from stdin (pkexec passes it on), straight to the helper
+    if sys.stdin.isatty():
+        fail("usb write: the content comes from stdin, e.g. openhu-cli usb write sdb1 Playlists/Car.m3u8 < Car.m3u8")
+    ensure_root()
+    stick = args.stick[len(MEDIA) + 1:] if args.stick.startswith(MEDIA + "/") else args.stick
+    data = helper("usb-stick", ["write", stick, args.path])
+    data.update({"stick": stick, "path": args.path})
+    output(data, f"{args.path} written to the USB stick {stick} ({data.get('bytes')} bytes), read-only again")
+    return 0
+
+
 # settings
 
 APPLIES = {"now": "", "reconnect": " – applies with the next Android Auto connection",
@@ -701,6 +719,10 @@ def complete_values(done):
             return sorted(available_timezones())
         if command == "time" and rest == ["ntp"]:
             return ["on", "off"]
+        if command == "usb" and rest == ["write"]:
+            return sorted(os.listdir(MEDIA)) if os.path.isdir(MEDIA) else []
+        if command == "usb" and len(rest) == 2:
+            return ["Playlists/"]
         if command == "ethernet" and rest == ["mode"]:
             return ["client", "server"]
         if command == "volume" and not rest:
@@ -754,6 +776,14 @@ def build_parser():
     sub = command("ethernet", "Ethernet port: DHCP client (router) or DHCP server for devices in the car", cmd_ethernet)
     sub.add_argument("action", choices=["status", "mode"], nargs="?", default="status")
     sub.add_argument("mode", nargs="?", help="mode: client | server")
+
+    sub = command("usb", "write a file on a USB stick: only Playlists/<name>.m3u8, the content from stdin (the stick "
+                  "is read-only otherwise and only writable for this moment)", cmd_usb,
+                  epilog="openhu-cli usb write sdb1 Playlists/Car.m3u8 < Car.m3u8 (the stick: a name in /run/media); "
+                         "at most 1 MB, no other folders, no hidden files")
+    sub.add_argument("action", choices=["write"])
+    sub.add_argument("stick", help="the stick's name in /run/media (sdb1) or its folder (/run/media/sdb1)")
+    sub.add_argument("path", help="Playlists/<name>.m3u8")
 
     sub = command("config", "settings of OpenHU (keys like in the settings page)", cmd_config)
     sub.add_argument("action", choices=["list", "keys", "get", "set"], nargs="?", default="list")

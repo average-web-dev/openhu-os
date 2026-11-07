@@ -1,6 +1,7 @@
 // The openhu user controls NetworkManager (wireless Android Auto hotspot), may reboot/power off and run the system
 // commands of openhu-cli as root with pkexec (system update, ssh switch and password, time zone and time,
-// Ethernet mode, restart of OpenHU): OpenHU's settings use them, and openhu-cli runs itself so for the openhu user.
+// Ethernet mode, a playlist on a USB stick, restart of OpenHU): OpenHU's settings and plugins use them, and openhu-cli
+// runs itself so for the openhu user.
 polkit.addRule(function(action, subject) {
     if (subject.user != "openhu")
         return polkit.Result.NOT_HANDLED;
@@ -11,7 +12,7 @@ polkit.addRule(function(action, subject) {
         || action.id == "org.freedesktop.login1.power-off-multiple-sessions")
         return polkit.Result.YES;
     if (action.id == "org.freedesktop.policykit.exec" && action.lookup("program") == "/usr/bin/openhu-cli"
-        && /^\/usr\/bin\/openhu-cli (update|ssh|time|ethernet|restart)( |$)/.test(action.lookup("command_line")))
+        && /^\/usr\/bin\/openhu-cli (update|ssh|time|ethernet|usb|restart)( |$)/.test(action.lookup("command_line")))
         return polkit.Result.YES;
     return polkit.Result.NOT_HANDLED;
 });
