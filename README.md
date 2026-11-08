@@ -141,7 +141,7 @@ Set in OpenHU (Settings → System, [openhu#36](https://github.com/average-web-d
 `openhu time`:
 
 ```bash
-openhu-cli time status --json            # {"zone", "ntp", "synchronized", "time"}
+openhu-cli time status --json            # {"zone", "ntp", "synchronized", "time", "rtc", "source"}
 openhu-cli time zone Europe/Berlin       # applies at once, also to running programs
 openhu-cli time ntp off                  # time from the internet (systemd-timesyncd) off
 openhu-cli time set "2026-10-13 14:30"   # local time (or seconds since 1970), only with ntp off
@@ -149,9 +149,16 @@ openhu-cli time set "2026-10-13 14:30"   # local time (or seconds since 1970), o
 
 `/etc/localtime` links to `/var/lib/openhu-os/time/localtime`, which links to the zone (UTC until one is
 chosen). glibc and Qt follow both links; `timedatectl` does not and shows the zone as "n/a", `date` and
-`openhu time` show it right. Time from the internet is on by default; switched off, the flag
-`/var/lib/openhu-os/time/ntp-off` keeps systemd-timesyncd from starting. Setting the time also sets the hardware
-clock. A Raspberry Pi 4 has none: after a power cut without internet it starts at the last time systemd saved.
+`openhu time` show it right. Time from the internet is on by default.
+
+Without internet the time comes from the hardware clock (RTC), else from the time systemd-timesyncd saved last
+(every minute and at shutdown, on the data partition), else from the image's build time; the clock only goes
+forward at boot, so an RTC with an empty battery is ignored. A Raspberry Pi 4 has no RTC: after a power cut
+without internet its clock is behind by the time it was off. `source` in the status says which one it was
+(`ntp`, `rtc`, `saved`, `build`, `manual`), `rtc` whether there is a hardware clock. systemd-timesyncd always
+runs: `ntp off` (the flag `/var/lib/openhu-os/time/ntp-off`) only takes its servers away. Setting the time also
+sets the hardware clock and the saved time. In a VM, `scripts/run-vm.sh --rtc 2000-01-01 --offline` starts with
+an RTC like one with an empty battery and without internet.
 
 ## Releases
 

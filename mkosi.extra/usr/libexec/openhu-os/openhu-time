@@ -2,15 +2,25 @@
 """Time zone, date and time of OpenHU OS, for the OpenHU settings (as the openhu user:
 pkexec /usr/libexec/openhu-os/openhu-time ...).
 
-  openhu-time status             {"zone", "ntp", "synchronized", "time"} as JSON
+  openhu-time status             {"zone", "ntp", "synchronized", "time", "rtc", "source"} as JSON
   openhu-time zone Europe/Berlin set the time zone (applies at once, also to running programs)
   openhu-time ntp on|off         time from the internet (systemd-timesyncd) on or off
   openhu-time set 1791820800     set the clock (seconds since 1970, UTC) and the hardware clock; only with ntp off
+  openhu-time boot               before systemd-timesyncd starts (its ExecStartPre): its NTP servers, the source
 
 /etc is read-only: /etc/localtime links to /var/lib/openhu-os/time/localtime, which links to the zone in
-/usr/share/zoneinfo (tmpfiles: UTC until one is chosen). "ntp off" is the file
-/var/lib/openhu-os/time/ntp-off, a condition of systemd-timesyncd (systemd-timesyncd.service.d/openhu-os.conf).
+/usr/share/zoneinfo (tmpfiles: UTC until one is chosen).
+
+Where the time comes from at boot: the kernel reads the hardware clock (RTC), systemd advances a clock behind
+the image's build time to it (/usr/lib/clock-epoch), and systemd-timesyncd advances it to the time it saved last
+(/var/lib/systemd/timesync/clock, written every minute and at shutdown). The clock only goes forward, so an RTC
+with an empty battery (2000-01-01) or none at all (Raspberry Pi 4) starts at the saved time. Then NTP, when on.
+
+systemd-timesyncd always runs, because only it saves and restores the time. "ntp off" is the file
+/var/lib/openhu-os/time/ntp-off: "boot" then gives it no servers (a runtime config in /run).
 """
+import ctypes
+import fcntl
 import json
 import os
 import re
@@ -23,6 +33,13 @@ LINK = DIR + "/localtime"
 NTP_OFF = DIR + "/ntp-off"
 ZONEINFO = "/usr/share/zoneinfo/"
 SYNCHRONIZED = "/run/systemd/timesync/synchronized"
+SAVED = "/var/lib/systemd/timesync/clock"
+EPOCH = "/usr/lib/clock-epoch"
+RTC = "/dev/rtc0"
+RTC_SINCE_EPOCH = "/sys/class/rtc/rtc0/since_epoch"
+TIMESYNCD_CONF = "/run/systemd/timesyncd.conf.d/openhu-os.conf"
+# where the clock came from at boot (rtc, saved, build) and "manual" after "set"
+SOURCE = "/run/openhu-os/time-source"
 ZONE_NAME = re.compile(r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$")
 # 2000-01-01 to 2100-01-01: a typo, not a date
 EARLIEST, LATEST = 946684800, 4102444800
@@ -33,14 +50,83 @@ def fail(message):
     sys.exit(1)
 
 
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def mtime(path):
+    try:
+        return int(os.stat(path).st_mtime)
+    except OSError:
+        return 0
+
+
 def status():
     try:
         target = os.readlink(LINK)
         zone = target[len(ZONEINFO):] if target.startswith(ZONEINFO) else ""
     except OSError:
         zone = ""
-    return {"zone": zone, "ntp": not os.path.exists(NTP_OFF), "synchronized": os.path.exists(SYNCHRONIZED),
-            "time": int(time.time())}
+    synchronized = os.path.exists(SYNCHRONIZED)
+    return {"zone": zone, "ntp": not os.path.exists(NTP_OFF), "synchronized": synchronized,
+            "time": int(time.time()), "rtc": os.path.exists(RTC),
+            "source": "ntp" if synchronized else read(SOURCE) or "unknown"}
+
+
+def boot():
+    """ExecStartPre of systemd-timesyncd, as root: its servers, and where the clock came from"""
+    if os.path.exists(NTP_OFF):
+        os.makedirs(os.path.dirname(TIMESYNCD_CONF), exist_ok=True)
+        with open(TIMESYNCD_CONF, "w") as f:
+            f.write("# openhu-time: time from the internet is off\n[Time]\nNTP=\nFallbackNTP=\n")
+    elif os.path.exists(TIMESYNCD_CONF):
+        os.remove(TIMESYNCD_CONF)
+    # only once per boot: a restart (ntp on/off) must not take the time it saved itself for the RTC's
+    if os.path.exists(SOURCE):
+        return
+    # timesyncd advances the clock to the saved time right after this; an RTC at least as late (a minute of
+    # slack: it saves every minute) is where the time came from, else the saved time, else the build time
+    rtc = int(read(RTC_SINCE_EPOCH) or 0)
+    saved, epoch = mtime(SAVED), mtime(EPOCH)
+    if rtc and rtc >= max(saved - 60, epoch):
+        source = "rtc"
+    elif saved > epoch:
+        source = "saved"
+    else:
+        source = "build"
+    write_source(source)
+
+
+def write_source(source):
+    os.makedirs(os.path.dirname(SOURCE), exist_ok=True)
+    with open(SOURCE, "w") as f:
+        f.write(source + "\n")
+
+
+class RtcTime(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int) for name in
+                ("tm_sec", "tm_min", "tm_hour", "tm_mday", "tm_mon", "tm_year", "tm_wday", "tm_yday", "tm_isdst")]
+
+
+# _IOW('p', 0x0a, struct rtc_time)
+RTC_SET_TIME = (1 << 30) | (ctypes.sizeof(RtcTime) << 16) | (ord("p") << 8) | 0x0a
+
+
+def write_rtc(seconds):
+    """the hardware clock in UTC (no /etc/adjtime: the RTC is UTC); none on a Raspberry Pi 4 without a module"""
+    if not os.path.exists(RTC):
+        return
+    t = time.gmtime(seconds)
+    value = RtcTime(t.tm_sec, t.tm_min, t.tm_hour, t.tm_mday, t.tm_mon - 1, t.tm_year - 1900, 0, 0, 0)
+    try:
+        with open(RTC, "rb") as f:
+            fcntl.ioctl(f, RTC_SET_TIME, value)
+    except OSError as e:
+        print(f"writing the hardware clock failed: {e}", file=sys.stderr)
 
 
 def set_zone(zone):
@@ -62,10 +148,10 @@ def set_ntp(on):
     if on:
         if os.path.exists(NTP_OFF):
             os.remove(NTP_OFF)
-        subprocess.run(["systemctl", "start", "systemd-timesyncd.service"], check=True)
     else:
         open(NTP_OFF, "w").close()
-        subprocess.run(["systemctl", "stop", "systemd-timesyncd.service"], check=True)
+    # its ExecStartPre (boot) writes the servers; it keeps saving the time either way
+    subprocess.run(["systemctl", "restart", "systemd-timesyncd.service"], check=True)
 
 
 def set_time(value):
@@ -77,10 +163,18 @@ def set_time(value):
         fail(f"not a time: {value}")
     if not EARLIEST <= seconds < LATEST:
         fail(f"not a plausible time: {value}")
-    # timedated also writes the hardware clock
-    result = subprocess.run(["timedatectl", "set-time", f"@{seconds}"], capture_output=True, text=True)
-    if result.returncode != 0:
-        fail(result.stderr.strip() or "setting the time failed")
+    # not timedatectl set-time: timedated refuses while systemd-timesyncd runs, and that runs always (see above)
+    try:
+        time.clock_settime(time.CLOCK_REALTIME, seconds)
+    except OSError as e:
+        fail(f"setting the time failed: {e}")
+    write_rtc(seconds)
+    # saved at once, not only within the minute: a power cut right after must not lose it (no RTC)
+    try:
+        os.utime(SAVED, (seconds, seconds))
+    except OSError:
+        pass
+    write_source("manual")
 
 
 def main(args):
@@ -96,8 +190,14 @@ def main(args):
         set_ntp(args[1] == "on")
     elif command == "set" and len(args) == 2:
         set_time(args[1])
+    elif command == "boot" and len(args) == 1:
+        boot()
+        return
     else:
         sys.exit(__doc__)
+    if command != "status":
+        # on the disk now, not with the next journal commit: the power may go any second in a car
+        os.sync()
     print(json.dumps(status()))
 
 

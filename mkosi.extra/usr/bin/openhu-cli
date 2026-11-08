@@ -335,9 +335,13 @@ def cmd_ssh(args):
 
 def time_text(data):
     clock = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    source = ("from the internet" + (", synchronized" if data.get("synchronized") else ", not synchronized yet")
-              if data.get("ntp") else "set by hand")
-    return f"{clock}, time zone {data.get('zone')}, {source}"
+    sources = {"ntp": "from the internet", "rtc": "from the hardware clock", "manual": "set by hand",
+               "saved": "the time saved at the last shutdown (may be behind)",
+               "build": "the image's build time (wrong: set it or connect to the internet)"}
+    source = sources.get(data.get("source"), "unknown source")
+    ntp = ("internet time on" + ("" if data.get("synchronized") else ", not synchronized yet")
+           if data.get("ntp") else "internet time off")
+    return f"{clock}, time zone {data.get('zone')}, {source}, {ntp}"
 
 
 def parse_time(text):
