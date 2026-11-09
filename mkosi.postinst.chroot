@@ -32,6 +32,10 @@ sed -i -e "s|^PRETTY_NAME=.*|PRETTY_NAME=\"OpenHU OS $IMAGE_VERSION ($debian)\"|
        -e 's|^SUPPORT_URL=.*|SUPPORT_URL="https://github.com/average-web-dev/openhu-os"|' \
        -e 's|^BUG_REPORT_URL=.*|BUG_REPORT_URL="https://github.com/average-web-dev/openhu-os/issues"|' \
        /usr/lib/os-release
+# Raspberry Pi image (#39): IMAGE_ID stays openhu-os, the board is the variant
+if [ "$ARCHITECTURE" = arm64 ]; then
+  printf 'VARIANT="Raspberry Pi"\nVARIANT_ID=rpi\n' >> /usr/lib/os-release
+fi
 printf 'OpenHU OS %s \\n \\l\n\n' "$IMAGE_VERSION" > /etc/issue
 printf 'OpenHU OS %s\n' "$IMAGE_VERSION" > /etc/issue.net
 # Login greeting: /etc/update-motd.d/10-openhu-os instead of Debian's uname line (/etc/motd is empty, mkosi.extra)

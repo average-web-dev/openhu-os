@@ -1,0 +1,11 @@
+# The Raspberry Pi archive also has its own builds of Mesa, FFmpeg, libcamera, Qt and more (+rpt versions), which
+# would replace Debian's. Nothing comes from it unless it is listed here (#39): the Pi kernels, the boot firmware,
+# the WiFi/Bluetooth firmware, vcgencmd (dev). A package added here needs a reason in mkosi.conf.d/40-rpi.conf.
+# The allow list comes first: the first matching entry wins.
+Package: linux-image-rpi-v8 linux-image-rpi-2712 linux-image-*+rpt-rpi-v8 linux-image-*+rpt-rpi-2712 linux-base-rpi-* linux-base-*+rpt-rpi-* raspi-firmware firmware-brcm80211 bluez-firmware raspi-utils-core libgpiolib0
+Pin: origin archive.raspberrypi.com
+Pin-Priority: 600
+
+Package: *
+Pin: origin archive.raspberrypi.com
+Pin-Priority: -1
